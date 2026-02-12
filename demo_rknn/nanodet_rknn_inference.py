@@ -6,13 +6,13 @@ Usage:
     # On RK3588 device:
     python3 nanodet_rknn.py \
         --model nanodet-plus-m-1.5x_416.rknn \
-        --config config/nanodet-plus-m-1.5x_416.yml \
         --image test.jpg \
-        --score_threshold 0.35
+        --score_threshold 0.45
 
 """
 
 import argparse
+import math
 import os
 import time
 
@@ -41,8 +41,9 @@ class NanoDetRKNN:
         num_classes=80,
         reg_max=7,
         strides=[8, 16, 32, 64],
-        score_threshold=0.35,
+        score_threshold=0.45,
         nms_threshold=0.6,
+        single_core=False,
     ):
         self.model_path = model_path
         self.input_shape = input_shape  # (width, height)
@@ -51,6 +52,7 @@ class NanoDetRKNN:
         self.strides = strides
         self.score_threshold = score_threshold
         self.nms_threshold = nms_threshold
+        self.single_core = single_core
 
         # Initialize RKNN
         self.rknn = RKNNLite()
@@ -64,14 +66,26 @@ class NanoDetRKNN:
 
         # Init runtime environment
         print("Init runtime environment...")
-        # For RK3588, cores can be: 0, 1, 2 (NPU cores)
-        # Use core_mask to specify which NPU cores to use
-        # 0: auto, 1: core0, 2: core1, 4: core2, 7: all cores
-        ret = self.rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2)
+        # Default: all NPU cores. Optional: single core 0.
+        core_mask = getattr(RKNNLite, "NPU_CORE_0_1_2", None)
+        core_desc = "multi-core (0_1_2)"
+        if self.single_core:
+            core_mask = getattr(RKNNLite, "NPU_CORE_0", core_mask)
+            core_desc = "single-core (0)"
+        try:
+            if core_mask is not None:
+                ret = self.rknn.init_runtime(core_mask=core_mask)
+            else:
+                ret = self.rknn.init_runtime()
+                core_desc = "runtime default"
+        except TypeError:
+            ret = self.rknn.init_runtime()
+            core_desc = "runtime default"
         if ret != 0:
             print("Init runtime environment failed!")
             exit(ret)
 
+        print(f"NPU mode: {core_desc}")
         print("RKNN model loaded successfully!")
 
         # Generate anchor points
@@ -82,10 +96,12 @@ class NanoDetRKNN:
         anchors_per_level = []
         strides_per_level = []
         for stride in self.strides:
-            h = self.input_shape[1] // stride
-            w = self.input_shape[0] // stride
-            shift_x = np.arange(0, w) + 0.5
-            shift_y = np.arange(0, h) + 0.5
+            # Match NanoDet+ decode: feat map sizes use ceil(input / stride)
+            h = math.ceil(self.input_shape[1] / stride)
+            w = math.ceil(self.input_shape[0] / stride)
+            # Grid priors are integer cell coordinates; stride scales to pixels.
+            shift_x = np.arange(0, w, dtype=np.float32)
+            shift_y = np.arange(0, h, dtype=np.float32)
             shift_x, shift_y = np.meshgrid(shift_x, shift_y)
             anchor = np.stack([shift_x, shift_y], axis=-1).reshape(-1, 2)
             anchors_per_level.append(anchor)
@@ -107,24 +123,13 @@ class NanoDetRKNN:
 
         # Keep BGR order — nanodet2rknn.py configures RKNN with BGR mean/std
         # so no cv2.cvtColor conversion is needed.
+        # RKNN runtime commonly expects NHWC input tensors.
+        img = np.expand_dims(img, axis=0)  # HWC -> NHWC
         return img
 
     def postprocess(self, outputs, image_shape):
         """
         Post-process RKNN outputs to get bounding boxes.
-
-        The ONNX model (_forward_onnx in NanoDetPlusHead) produces a **single**
-        tensor of shape (1, N, num_classes + 4*(reg_max+1)) where:
-          - N = total anchor points across all stride levels
-          - cls scores already have sigmoid applied
-          - values are [cls_score_0 .. cls_score_C-1, reg_0 .. reg_4*(R+1)-1]
-
-        Args:
-            outputs: List with one tensor from RKNN inference
-            image_shape: Original image shape (h, w, c)
-
-        Returns:
-            List of detections: [[x1, y1, x2, y2, score, class_id], ...]
         """
         # Single-tensor output from the ONNX / RKNN model
         output = outputs[0]
@@ -263,8 +268,13 @@ class NanoDetRKNN:
 
         # Inference
         start_time = time.time()
-        outputs = self.rknn.inference(inputs=[img])
+        outputs = self.rknn.inference(inputs=[img], data_format="nhwc")
         inference_time = time.time() - start_time
+
+        if outputs is None:
+            raise RuntimeError(
+                "RKNN inference returned None. Check input size/layout and model compatibility."
+            )
 
         # Postprocess
         detections = self.postprocess(outputs, image.shape)
@@ -276,7 +286,7 @@ class NanoDetRKNN:
         self.rknn.release()
 
 
-def visualize(image, detections, class_names, score_threshold=0.35):
+def visualize(image, detections, class_names, score_threshold=0.45):
     """Draw bounding boxes on image"""
     for det in detections:
         x1, y1, x2, y2, score, class_id = det
@@ -339,8 +349,8 @@ def parse_args():
     parser.add_argument(
         "--score_threshold",
         type=float,
-        default=0.35,
-        help="Score threshold (default: 0.35)",
+        default=0.45,
+        help="Score threshold (default: 0.45)",
     )
     parser.add_argument(
         "--nms_threshold",
@@ -352,9 +362,15 @@ def parse_args():
         "--save", action="store_true", help="Save result image"
     )
     parser.add_argument(
-        "--benchmark", action="store_true", help="Run benchmark (100 iterations)"
+        "--benchmark",
+        action="store_true",
+        help="Run inference on --image for 500 iterations and report average time",
     )
-
+    parser.add_argument(
+        "--single_core",
+        action="store_true",
+        help="Use only NPU core 0 (default: use multi-core)",
+    )
     return parser.parse_args()
 
 
@@ -391,29 +407,10 @@ def main():
         strides=strides,
         score_threshold=args.score_threshold,
         nms_threshold=args.nms_threshold,
+        single_core=args.single_core,
     )
 
-    if args.benchmark:
-        # Benchmark mode
-        print("\nRunning benchmark (100 iterations)...")
-        dummy_img = np.random.randint(0, 255, (input_size[1], input_size[0], 3), dtype=np.uint8)
-        
-        times = []
-        for i in range(100):
-            _, inference_time = detector.inference(dummy_img)
-            times.append(inference_time)
-            if i % 10 == 0:
-                print(f"Iteration {i}/100")
-
-        times = times[10:]  # Remove first 10 for warmup
-        avg_time = np.mean(times)
-        fps = 1.0 / avg_time
-
-        print(f"\nBenchmark Results:")
-        print(f"  Average inference time: {avg_time*1000:.2f}ms")
-        print(f"  FPS: {fps:.2f}")
-        
-    elif args.image:
+    if args.image:
         # Image inference
         if not os.path.exists(args.image):
             print(f"Error: Image not found: {args.image}")
@@ -426,11 +423,23 @@ def main():
             print(f"Error: Failed to load image: {args.image}")
             return
 
-        # Inference
-        detections, inference_time = detector.inference(image)
+        if args.benchmark:
+            num_iters = 500
+            print(f"\nRunning benchmark on the same image for {num_iters} iterations...")
+            times = []
+            detections = []
+            for _ in range(num_iters):
+                detections, inference_time = detector.inference(image)
+                times.append(inference_time)
 
-        print(f"\nInference time: {inference_time*1000:.2f}ms ({1/inference_time:.2f} FPS)")
-        print(f"Detected {len(detections)} objects")
+            avg_time = float(np.mean(times))
+            print(f"\nAverage inference time ({num_iters} runs): {avg_time*1000:.2f}ms")
+            print(f"Detected {len(detections)} objects (last run)")
+        else:
+            # Single inference
+            detections, inference_time = detector.inference(image)
+            print(f"\nInference time: {inference_time*1000:.2f}ms")
+            print(f"Detected {len(detections)} objects")
 
         # Visualize
         result_img = visualize(image, detections, COCO_CLASSES, args.score_threshold)
@@ -446,7 +455,7 @@ def main():
             cv2.waitKey(0)
             cv2.destroyAllWindows()
     else:
-        print("Error: Please specify --image or --benchmark")
+        print("Error: Please specify --image")
 
     # Release
     detector.release()
