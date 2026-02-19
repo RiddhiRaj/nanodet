@@ -387,14 +387,13 @@ class YOLOv8RKNN:
 
         if self.quantized:
             inp = np.expand_dims(inp, axis=0)
-            data_format = "nhwc"
         else:
-            inp = inp.astype(np.float32) / 255.0
-            inp = inp.transpose(2, 0, 1)[None]
-            data_format = "nchw"
+            # Feed float models in NHWC to match RKNN runtime input layout and
+            # avoid per-frame NCHW->NHWC conversion warnings.
+            inp = np.expand_dims(inp.astype(np.float32) / 255.0, axis=0)
 
         t0 = time.time()
-        outputs = self.rknn.inference(inputs=[inp], data_format=data_format)
+        outputs = self.rknn.inference(inputs=[inp], data_format="nhwc")
         inference_time = time.time() - t0
 
         if outputs is None:
@@ -409,8 +408,42 @@ class YOLOv8RKNN:
 
 #viz
 def draw_detections(image, detections, class_names, color, label_prefix="",
-                    score_threshold=0.0):
-    """Draw bounding boxes on image with a given color and optional label prefix."""
+                    score_threshold=0.0, occupied_labels=None, prefer_top=True):
+    """Draw detections and place labels so they do not cover each other."""
+    if occupied_labels is None:
+        occupied_labels = []
+
+    img_h, img_w = image.shape[:2]
+
+    def overlaps(r1, r2):
+        return not (r1[2] <= r2[0] or r2[2] <= r1[0] or r1[3] <= r2[1] or r2[3] <= r1[1])
+
+    def find_label_rect(x1, y1, x2, y2, label_w, label_h):
+        step = label_h + 4
+        max_steps = 20
+
+        top_y = y1 - label_h
+        bottom_y = y2
+        if not prefer_top:
+            top_y, bottom_y = bottom_y, top_y
+
+        candidates = []
+        for i in range(max_steps):
+            candidates.append((x1, top_y - i * step))
+            candidates.append((x1, bottom_y + i * step))
+
+        for rx, ry in candidates:
+            rx = max(0, min(rx, img_w - label_w))
+            ry = max(0, min(ry, img_h - label_h))
+            rect = (rx, ry, rx + label_w, ry + label_h)
+            if all(not overlaps(rect, occ) for occ in occupied_labels):
+                return rect
+
+        # Fallback: clamp to image and place at preferred side.
+        rx = max(0, min(x1, img_w - label_w))
+        ry = max(0, min(top_y, img_h - label_h))
+        return (rx, ry, rx + label_w, ry + label_h)
+
     for det in detections:
         x1, y1, x2, y2, score, class_id = det
         if score < score_threshold:
@@ -420,10 +453,16 @@ def draw_detections(image, detections, class_names, color, label_prefix="",
         label = f"{label_prefix}{class_names[class_id]}: {score:.2f}"
         cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
         lsz, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-        cv2.rectangle(image, (x1, y1 - lsz[1] - 10), (x1 + lsz[0], y1), color, -1)
-        cv2.putText(image, label, (x1, y1 - 5),
+        label_w = lsz[0] + 6
+        label_h = lsz[1] + 10
+
+        lx1, ly1, lx2, ly2 = find_label_rect(x1, y1, x2, y2, label_w, label_h)
+        occupied_labels.append((lx1, ly1, lx2, ly2))
+
+        cv2.rectangle(image, (lx1, ly1), (lx2, ly2), color, -1)
+        cv2.putText(image, label, (lx1 + 3, ly2 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-    return image
+    return image, occupied_labels
 
 
 #threaded inference
@@ -504,8 +543,8 @@ Examples:
                       help="YOLOv8 input size: int or H,W (default: 640)")
     yolo.add_argument("--yolo_quantized", action="store_true",
                       help="YOLOv8 model is quantized (uint8 input)")
-    yolo.add_argument("--yolo_score_threshold", type=float, default=0.25,
-                      help="YOLOv8 score threshold (default: 0.25)")
+    yolo.add_argument("--yolo_score_threshold", type=float, default=0.45,
+                      help="YOLOv8 score threshold (default: 0.45)")
     yolo.add_argument("--yolo_nms_threshold", type=float, default=0.45,
                       help="YOLOv8 NMS threshold (default: 0.45)")
 
@@ -593,10 +632,15 @@ def _run_image(args, nanodet, yolov8):
 
     # Draw both sets of detections (green=NanoDet, blue=YOLOv8)
     vis = image.copy()
-    draw_detections(vis, nano_dets, COCO_CLASSES_NANODET, (0, 255, 0),
-                    label_prefix="[N] ", score_threshold=args.nanodet_score_threshold)
-    draw_detections(vis, yolo_dets, COCO_CLASSES_YOLO, (255, 128, 0),
-                    label_prefix="[Y] ", score_threshold=args.yolo_score_threshold)
+    _, occupied = draw_detections(
+        vis, nano_dets, COCO_CLASSES_NANODET, (0, 255, 0),
+        label_prefix="[N] ", score_threshold=args.nanodet_score_threshold, prefer_top=True
+    )
+    draw_detections(
+        vis, yolo_dets, COCO_CLASSES_YOLO, (255, 128, 0),
+        label_prefix="[Y] ", score_threshold=args.yolo_score_threshold,
+        occupied_labels=occupied, prefer_top=False
+    )
 
     if args.save:
         base, ext_name = os.path.splitext(args.input)
@@ -651,10 +695,15 @@ def _run_video(args, nanodet, yolov8):
               f"YOLOv8: {yolo_ms:.1f}ms ({len(yolo_dets)} obj)", end="")
 
         vis = frame.copy()
-        draw_detections(vis, nano_dets, COCO_CLASSES_NANODET, (0, 255, 0),
-                        label_prefix="[N] ", score_threshold=args.nanodet_score_threshold)
-        draw_detections(vis, yolo_dets, COCO_CLASSES_YOLO, (255, 128, 0),
-                        label_prefix="[Y] ", score_threshold=args.yolo_score_threshold)
+        _, occupied = draw_detections(
+            vis, nano_dets, COCO_CLASSES_NANODET, (0, 255, 0),
+            label_prefix="[N] ", score_threshold=args.nanodet_score_threshold, prefer_top=True
+        )
+        draw_detections(
+            vis, yolo_dets, COCO_CLASSES_YOLO, (255, 128, 0),
+            label_prefix="[Y] ", score_threshold=args.yolo_score_threshold,
+            occupied_labels=occupied, prefer_top=False
+        )
 
         if writer:
             writer.write(vis)
@@ -684,23 +733,26 @@ def _run_benchmark(nanodet, yolov8, image):
     num_iters = 500
     print(f"\nRunning benchmark: {num_iters} iterations (parallel on separate cores)...")
 
-    nano_times, yolo_times = [], []
+    nano_total = 0.0
+    yolo_total = 0.0
+
     for i in range(num_iters):
         (_, nano_t), (_, yolo_t) = dual_inference(nanodet, yolov8, image)
-        nano_times.append(nano_t * 1000)
-        yolo_times.append(yolo_t * 1000)
+
+        nano_total += nano_t * 1000  # ms
+        yolo_total += yolo_t * 1000  # ms
+
         if (i + 1) % 50 == 0:
             print(f"  {i + 1}/{num_iters} ...")
 
-    print(f"\n{'Model':<12} {'Avg (ms)':<12} {'Min (ms)':<12} {'Max (ms)':<12} {'Std (ms)':<12}")
-    print(f"{'─'*60}")
-    print(f"{'NanoDet':<12} {np.mean(nano_times):<12.2f} "
-          f"{np.min(nano_times):<12.2f} {np.max(nano_times):<12.2f} "
-          f"{np.std(nano_times):<12.2f}")
-    print(f"{'YOLOv8':<12} {np.mean(yolo_times):<12.2f} "
-          f"{np.min(yolo_times):<12.2f} {np.max(yolo_times):<12.2f} "
-          f"{np.std(yolo_times):<12.2f}")
+    nano_avg = nano_total / num_iters
+    yolo_avg = yolo_total / num_iters
 
+    print("\nBenchmark Results (avg)")
+    print(f"{'Model':<12} {'avg (ms)':<12}")
+    print(f"{'─'*24}")
+    print(f"{'NanoDet':<12} {nano_avg:<12.2f}")
+    print(f"{'YOLOv8':<12} {yolo_avg:<12.2f}")
 
 if __name__ == "__main__":
     main()
